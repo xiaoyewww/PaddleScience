@@ -12,14 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import gc
-import logging
 import os
 import random
 from argparse import Namespace
 from collections import OrderedDict
 
 import hydra
+import logging
 import numpy as np
 import paddle
 import paddle.amp as amp
@@ -40,6 +41,7 @@ from ppsci.arch.data_efficient_nopt_model import fno_pretrain as fno
 from ppsci.arch.data_efficient_nopt_model import gaussian_blur
 from ppsci.data.dataset.data_efficient_nopt_dataset import MixedDatasetLoader
 from ppsci.data.dataset.data_efficient_nopt_dataset import PoisHelmDatasetLoader
+
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +90,7 @@ def param_diff(params1, params2):
         return total_norm**0.5
 
 
-def add_weight_decay(model, weight_decay=1e-5, inner_lr=1e-3, skip_list=()):
+def add_weight_decay(model, weight_decay=1e-5, skip_list=()):
     decay = []
     no_decay = []
     for name, param in model.named_parameters():
@@ -108,18 +110,15 @@ def add_weight_decay(model, weight_decay=1e-5, inner_lr=1e-3, skip_list=()):
 
 
 class Trainer:
-    def __init__(self, params, global_rank, local_rank, device, sweep_id=None):
-        self.device = device
+    def __init__(self, params, global_rank, local_rank, sweep_id=None):
         self.params = params
         self.global_rank = global_rank
         self.local_rank = local_rank
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
         self.sweep_id = sweep_id
-        self.log_to_screen = params.log_to_screen
         self.train_loss = nn.MSELoss()
-        self.startEpoch = 0
+        self.start_epoch = 0
         self.epoch = 0
-        self.debug_grad = params.debug_grad
         self.mp_type = (
             "bfloat16"
             if paddle.device.cuda.device_count() >= 1
@@ -135,24 +134,18 @@ class Trainer:
             logger.info("Loading checkpoint %s" % params.checkpoint_path)
             self.restore_checkpoint(params.checkpoint_path)
         elif params.resuming is False and params.pretrained:
-            logger.info(
-                "Starting from pretrained model at %s" % params.pretrained_ckpt_path
-            )
+            logger.info("Starting from pretrained model at %s" % params.pretrained_ckpt_path)
             self.restore_checkpoint(params.pretrained_ckpt_path)
             self.iters = 0
-            self.startEpoch = 0
+            self.start_epoch = 0
         else:
             pass
 
         self.initialize_scheduler(self.params)
 
+
     def initialize_data(self, params):
-        if params.tie_batches:
-            in_rank = 0
-        else:
-            in_rank = self.global_rank
-        if self.log_to_screen:
-            print(f"Initializing data on rank {self.global_rank}")
+        logger.info(f"Initializing data on rank {self.global_rank}")
 
         if self.params.model_type == "fno":
             if params.mode == "train":
@@ -164,6 +157,7 @@ class Trainer:
             ) = PoisHelmDatasetLoader(
                 params, params.train_path, dist.is_initialized(), train=True
             )
+
             (
                 self.valid_data_loader,
                 self.valid_dataset,
@@ -171,37 +165,9 @@ class Trainer:
             ) = PoisHelmDatasetLoader(
                 params, params.val_path, dist.is_initialized(), train=False
             )
-        elif self.params.model_type == "vmae":
-            params.masking = (
-                (
-                    params.n_steps,
-                    params.input_size // params.patch_size,
-                    params.input_size // params.patch_size,
-                ),
-                params.mask_ratio,
-            )
+        else:
+            raise NotImplementedError
 
-            (
-                self.train_data_loader,
-                self.train_dataset,
-                self.train_sampler,
-            ) = MixedDatasetLoader(
-                params,
-                params.train_data_paths,
-                dist.is_initialized(),
-                split="train",
-                rank=in_rank,
-                train_offset=self.params.embedding_offset,
-            )
-            self.valid_data_loader, self.valid_dataset, _ = MixedDatasetLoader(
-                params,
-                params.valid_data_paths,
-                dist.is_initialized(),
-                split="val",
-                rank=in_rank,
-            )
-        if dist.is_initialized():
-            self.train_sampler.set_epoch(0)
 
     def initialize_model(self, params):
         if self.params.model_type == "fno":
@@ -219,9 +185,10 @@ class Trainer:
                 find_unused_parameters=True,
             )
 
-        print(
+        logger.info(
             f"Model parameter count: {sum([p.numel() for p in self.model.parameters()])}"
         )
+
 
     def initialize_optimizer(self, params):
         parameters = add_weight_decay(self.model, self.params.weight_decay)
@@ -235,6 +202,7 @@ class Trainer:
             enable=(self.mp_type == paddle.float16 and params.enable_amp)
         )
 
+
     def initialize_scheduler(self, params):
         if params.scheduler_epochs > 0:
             sched_epochs = params.scheduler_epochs
@@ -244,14 +212,14 @@ class Trainer:
             if self.params.learning_rate < 0:
                 self.scheduler = paddle.optimizer.lr.CosineAnnealingDecay(
                     learning_rate=self.optimizer.get_lr(),
-                    last_epoch=(self.startEpoch * params.epoch_size) - 1,
+                    last_epoch=(self.start_epoch * params.epoch_size) - 1,
                     T_max=sched_epochs * params.epoch_size,
                     eta_min=params.learning_rate / 100,
                 )
                 self.optimizer.set_lr_scheduler(self.scheduler)
             else:
                 k = params.warmup_steps
-                if (self.startEpoch * params.epoch_size) < k:
+                if (self.start_epoch * params.epoch_size) < k:
                     warmup = paddle.optimizer.lr.LinearLR(
                         learning_rate=self.optimizer.get_lr(),
                         start_factor=0.01,
@@ -285,6 +253,7 @@ class Trainer:
         else:
             self.scheduler = None
 
+
     def save_checkpoint(self, checkpoint_path, model=None):
         """Save model and optimizer to checkpoint"""
         if not model:
@@ -300,6 +269,7 @@ class Trainer:
             checkpoint_path,
         )
 
+
     def restore_checkpoint(self, checkpoint_path):
         """Load model/opt from path"""
         checkpoint = paddle.load(checkpoint_path)
@@ -314,13 +284,14 @@ class Trainer:
 
         if self.params.resuming:
             self.optimizer.set_state_dict(checkpoint["optimizer_state_dict"])
-            self.startEpoch = checkpoint["epoch"]
-            self.epoch = self.startEpoch
+            self.start_epoch = checkpoint["epoch"]
+            self.epoch = self.start_epoch
             self.iters = checkpoint["iters"]
         else:
             self.iters = 0
         checkpoint = None
         self.model = self.model
+
 
     def train_one_epoch(self):
         self.model.train()
@@ -353,11 +324,11 @@ class Trainer:
                         inp_blur.append(_inp)
                     inp_blur = paddle.stack(inp_blur, axis=0)
                 else:
-                    inp_blur = inp.detach().clone()
+                    inp_blur = inp.clone()
             else:
                 inp, label = map(lambda x: x, data)
                 mask = None
-                inp_blur = inp.detach().clone()
+                inp_blur = inp.clone()
             if len(inp.shape) == 5:
                 inp = rearrange(inp, "b t c h w -> t b c h w")
                 inp_blur = rearrange(inp_blur, "b t c h w -> t b c h w")
@@ -425,38 +396,16 @@ class Trainer:
                     logs["train_loss"] += loss
                     log_nrmse = raw_loss.sqrt().mean()
                 self.gscaler.scale(loss).backward()
-
-                if self.debug_grad and self.model.require_backward_grad_sync:
-                    with paddle.no_grad():
-                        self.gscaler.unscale_(self.optimizer)
-                        grad_diff = grad_norm(self.model.parameters())
-                        porig = [p.clone() for p in self.model.parameters()]
-
                 if self.model.require_backward_grad_sync:
                     self.gscaler.unscale_(self.optimizer)
                     paddle.nn.utils.clip_grad_norm_(self.model.parameters(), 1)
                     self.gscaler.step(self.optimizer)
                     self.gscaler.update()
-                    if self.debug_grad:
-                        if self.global_rank == 0:
-                            pdiff = param_diff(self.model.parameters(), porig)
-                            print(
-                                "grad_norm",
-                                grad_diff,
-                                "last_step_size",
-                                pdiff,
-                                "loss",
-                                loss.item(),
-                                "data_shape",
-                                label.shape,
-                            )
                     self.optimizer.clear_gradients(set_to_zero=False)
                     if self.scheduler is not None:
                         self.scheduler.step()
                 if (
-                    self.log_to_screen
-                    and batch_idx % self.params.log_interval == 0
-                    and self.global_rank == 0
+                    batch_idx % self.params.log_interval == 0
                 ):
                     logger.info(
                         f"Epoch {self.epoch}/{self.params.max_epochs} Batch {batch_idx+1}/{len(self.train_data_loader)} Train Loss {log_nrmse.item():.2e}"
@@ -464,7 +413,7 @@ class Trainer:
         logs = {k: v / steps for k, v in logs.items()}
         if dist.is_initialized():
             for key in sorted(logs.keys()):
-                dist.all_reduce(logs[key].detach())
+                dist.all_reduce(logs[key])
                 logs[key] = float(logs[key] / dist.get_world_size())
 
         self.iters += steps
@@ -475,21 +424,15 @@ class Trainer:
         logs["train_l2"] = logs["train_l2"].item() / n
         return logs
 
+
     def single_dset_val(self, subset, logs, cutoff=40):
-        if self.params.use_ddp:
-            temp_loader = paddle.io.DataLoader(
-                subset,
-                batch_size=self.params.batch_size,
-                num_workers=self.params.num_data_workers,
-            )
-        else:
-            temp_loader = paddle.io.DataLoader(
-                subset,
-                batch_size=self.params.batch_size,
-                num_workers=self.params.num_data_workers,
-                shuffle=True,
-                drop_last=True,
-            )
+        temp_loader = paddle.io.DataLoader(
+            subset,
+            batch_size=self.params.batch_size,
+            num_workers=self.params.num_data_workers,
+            shuffle=True,
+            drop_last=True,
+        )
         count = 0
         for _, data in enumerate(temp_loader):
             if count > cutoff:
@@ -520,9 +463,14 @@ class Trainer:
             logs["valid_l2"] += l2_err(output, label, spatial_dims).item()
         else:
             del temp_loader
-        logs["valid_nrmse"] = logs["valid_nrmse"].item() / count
-        logs["valid_l2"] = logs["valid_l2"].item() / count
-        return logs
+            if count > 0:
+                logs["valid_nrmse"] = logs["valid_nrmse"].item() / count
+                logs["valid_l2"] = logs["valid_l2"].item() / count
+            else:
+                logs["valid_nrmse"] = paddle.zeros([1])
+                logs["valid_l2"] = paddle.zeros([1])
+            return logs
+
 
     def validate_one_epoch(self, full=False):
         """
@@ -538,8 +486,8 @@ class Trainer:
         with paddle.no_grad():
             with amp.auto_cast(enable=False, dtype=self.mp_type):
                 logs = {
-                    "valid_nrmse": paddle.zeros([1]),
-                    "valid_l2": paddle.zeros([1]),
+                    "valid_nrmse":paddle.zeros([1]),
+                    "valid_l2":paddle.zeros([1]),
                 }
                 if hasattr(self.valid_dataset, "sub_dsets"):
                     for subset_group in self.valid_dataset.sub_dsets:
@@ -548,19 +496,19 @@ class Trainer:
                 else:
                     logs = self.single_dset_val(self.valid_dataset, logs, cutoff)
 
+
             if dist.is_initialized():
                 for key in sorted(logs.keys()):
-                    dist.all_reduce(logs[key].detach())
+                    dist.all_reduce(logs[key])
                     logs[key] = float(logs[key].item() / dist.get_world_size())
                     if "rmse" in key:
                         logs[key] = logs[key]
         return logs
 
+
     def train(self):
-        logger.info(
-            f"iters per epoch = {len(self.train_data_loader)}, samples number = {len(self.train_dataset)}, batch size = {self.params.batch_size}, total batches = {len(self.train_data_loader)*self.params.batch_size}"
-        )
-        for epoch in range(self.startEpoch, self.params.max_epochs):
+        logger.info(f"iters per epoch = {len(self.train_data_loader)}, samples number = {len(self.train_dataset)}, batch size = {self.params.batch_size}, total batches = {len(self.train_data_loader)*self.params.batch_size}")
+        for epoch in range(self.start_epoch, self.params.max_epochs):
             if dist.is_initialized():
                 self.train_sampler.set_epoch(epoch)
             train_logs = self.train_one_epoch()
@@ -572,52 +520,39 @@ class Trainer:
             gc.collect()
             paddle.device.cuda.empty_cache()
             if epoch % self.params.checkpoint_save_interval == 0:
-                save_dir = self.params.checkpoint_path.replace(
-                    "ckpt", f"ckpt_epoch_{epoch}"
-                )
-                logger.info("saving checkpoint : save_dir")
+                save_dir = self.params.checkpoint_path.replace("ckpt", f"ckpt_epoch_{epoch}")
+                logger.info(f"saving checkpoint : save_dir")
                 self.save_checkpoint(save_dir)
-            logger.info(
-                f"Train loss: {train_logs['train_nrmse']:.2e}, Valid Loss: {valid_logs['valid_nrmse']:.2e}\n"
-            )
+            logger.info(f"Train loss: {train_logs['train_nrmse']:.2e}, Valid Loss: {valid_logs['valid_nrmse']:.2e}\n")
 
-        save_dir = self.params.checkpoint_path.replace("ckpt", "ckpt_last")
+        save_dir = self.params.checkpoint_path.replace("ckpt", f"ckpt_last")
         logger.info(f"saving checkpoint : {save_dir}")
         self.save_checkpoint(save_dir)
 
 
 def train(config: DictConfig):
     params = YParams(config.train_config, config.config, config.mode)
-    params.use_ddp = config.use_ddp
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     global_rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
-    if config.use_ddp:
-        dist.init_process_group("nccl")
-
-    device = f"gpu:{local_rank}" if paddle.device.cuda.device_count() >= 1 else "cpu"
-    paddle.set_device(device)
 
     params.batch_size = int(params.batch_size // world_size)
-    params.startEpoch = 0
+    params.start_epoch = 0
     exp_dir = os.path.join(params.exp_dir, config.config, str(config.run_name))
 
-    params.old_exp_dir = exp_dir
-    params.experiment_dir = os.path.abspath(exp_dir)
-    params.checkpoint_path = os.path.join(exp_dir, "training_checkpoints/ckpt.tar")
-    params.best_checkpoint_path = os.path.join(
-        exp_dir, "training_checkpoints/best_ckpt.tar"
-    )
-    params.old_checkpoint_path = os.path.join(
-        params.old_exp_dir, "training_checkpoints/best_ckpt.tar"
-    )
 
-    if global_rank == 0 and not os.path.isdir(exp_dir):
-        os.makedirs(exp_dir)
-        os.makedirs(os.path.join(exp_dir, "training_checkpoints/"))
-    params.resuming = True if os.path.isfile(params.checkpoint_path) else False
+    if global_rank == 0:
+        if not os.path.isdir(exp_dir):
+            os.makedirs(exp_dir)
+            os.makedirs(os.path.join(exp_dir, "training_checkpoints/"))
+    if params.resuming == True:
+        logger.info(f"check the checkpoint file existence : {params.checkpoint_path}")
+        if os.path.isfile(params.checkpoint_path):
+            pass
+        else:
+            raise FileNotFoundError
+
     params.name = str(config.run_name)
-    params.log_to_screen = (global_rank == 0) and params.log_to_screen
 
     if global_rank == 0:
         hparams = ruamelDict()
@@ -626,27 +561,21 @@ def train(config: DictConfig):
             hparams[str(key)] = str(value)
         with open(os.path.join(exp_dir, "hyperparams.yaml"), "w") as hpfile:
             yaml.dump(hparams, hpfile)
-    trainer = Trainer(params, global_rank, local_rank, device, sweep_id=config.sweep_id)
-    if config.sweep_id and trainer.global_rank == 0:
-        print(config.sweep_id, trainer.params.entity, trainer.params.project)
-    else:
-        trainer.train()
+    trainer = Trainer(params, global_rank, local_rank, sweep_id=config.sweep_id)
+    trainer.train()
 
 
 @paddle.no_grad()
 def inference(config):
     config = config.infer_config
     if config.ckpt_path:
-        save_dir = os.path.join(
-            "/".join(config.ckpt_path.split("/")[:-1]), "results_icl"
-        )
+        save_dir = os.path.join("/".join(config.ckpt_path.split("/")[:-1]), "results_icl")
     else:
         basedir = os.path.join("exp", config["log"]["logdir"])
         save_dir = os.path.join(basedir, "results_icl")
     os.makedirs(save_dir, exist_ok=True)
     save_path = os.path.join(
-        save_dir,
-        "fno-prediction-demo%d.pt" % (config.num_demos if config.num_demos else 0),
+        save_dir, "fno-prediction-demo%d.pt" % (config.num_demos if config.num_demos else 0)
     )
 
     params = Namespace(**config)
@@ -656,13 +585,13 @@ def inference(config):
         params.local_valid_batch_size = config["batch_size"]
     else:
         params.local_valid_batch_size = 1
-    dataloader, dataset, sampler = PoisHelmDatasetLoader(
+    dataloader, _, _ = PoisHelmDatasetLoader(
         params, params.test_path, dist.is_initialized(), train=False
     )
     if config.num_demos is not None and config.num_demos != 0:
         params.subsample = 1
         params.local_valid_batch_size = config.num_demos
-        dataloader_icl, dataset_icl, _ = PoisHelmDatasetLoader(
+        dataloader_icl, _, _ = PoisHelmDatasetLoader(
             params, params.train_path, dist.is_initialized(), train=False
         )
         input_demos, target_demos = next(iter(dataloader_icl))
@@ -711,25 +640,23 @@ def inference(config):
             u = model(inputs)
         else:
             model.target = targets
-            u = model.forward_icl(
-                inputs, input_demos, target_demos, use_tqdm=config.tqdm
-            )
+            u = model.forward_icl(inputs, input_demos, target_demos)
 
-        data_loss = l2_err(u.detach(), targets.detach())
+        data_loss = l2_err(u, targets)
         losses.append(data_loss.item())
         data_loss_normalized = l2_err(
-            u.detach() / paddle.abs(u).max(),
-            targets.detach() / paddle.abs(targets).max(),
+            u / paddle.abs(u).max(),
+            targets / paddle.abs(targets).max(),
         )
         losses_normalized.append(data_loss_normalized.item())
-        truth_list.append(targets.cpu())
-        pred_list.append(u.cpu())
+        truth_list.append(targets)
+        pred_list.append(u)
 
-    slope, intercept, r, p, se = linregress(
+    slope, _, r, _, _ = linregress(
         paddle.concat(pred_list, axis=0).view([-1]).numpy(),
         paddle.concat(truth_list, axis=0).view([-1]).numpy(),
     )
-    print(
+    logger.info(
         "L2:",
         np.mean(losses),
         "L2 (normalized)",
@@ -749,7 +676,7 @@ def inference(config):
             "rmse_normalized": np.mean(losses_normalized),
             "r2": r,
             "slope": slope,
-        },
+        }, # type: ignore
         save_path,
     )
 
@@ -765,9 +692,7 @@ def main(config: DictConfig):
     elif config.mode == "infer":
         inference(config)
     else:
-        raise ValueError(
-            f"config.mode should in ['train', 'infer'], but got '{config.mode}'"
-        )
+        raise ValueError(f"config.mode should in ['train', 'finetune', 'infer'], but got '{config.mode}'")
 
 
 if __name__ == "__main__":
